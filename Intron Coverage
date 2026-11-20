@@ -1,0 +1,420 @@
+# RNA-seq Intron Coverage Analysis
+## Reproducible protocol using deepTools, BEDTools, SAMtools, and Python
+
+### 1. Overview
+
+This workflow measures intronic RNA-seq coverage in three biological replicates.
+
+Two complementary analyses are performed:
+
+**Analysis A — Intron coverage profile**
+- Measures average RNA-seq coverage along introns.
+- Scales introns to a common length.
+- Generates a 5′–3′ coverage profile and heatmap.
+- Compares the three replicates.
+
+**Analysis B — Intron coverage breadth**
+- Measures the percentage of bases covered within each intron.
+- Categorizes introns according to the percentage of their length covered.
+- Generates grouped and 100% stacked bar plots.
+
+### 2. Input files and software
+
+**Input BAM files**
+- `treat_1Aligned.out.bam`
+- `treat_2Aligned.out.bam`
+- `treat_3Aligned.out.bam`
+
+**Annotation**
+- *Caenorhabditis elegans*
+- WBPS18 canonical gene set GTF:
+  `caenorhabditis_elegans.PRJNA13758.WBPS18.canonical_geneset.gtf`
+
+**Software**
+- SAMtools
+- BEDTools
+- deepTools
+- Python 3
+- pandas
+- matplotlib
+
+Activate the Conda environment:
+
+```bash
+conda activate rnaseq
+```
+
+### 3. Prepare intron BED file
+
+A transcript-specific `introns.gtf` file was generated from the canonical gene annotation.
+
+Convert the GTF to a six-column BED file:
+
+```bash
+awk 'BEGIN{OFS="\t"} $3=="intron" {
+    n++
+    print $1,$4-1,$5,"intron_"n,0,$7
+}' introns.gtf > introns_for_coverage.bed
+```
+
+The resulting BED file contains:
+- Chromosome
+- Start coordinate
+- End coordinate
+- Intron ID
+- Score
+- Strand
+
+Check the number of introns:
+
+```bash
+wc -l introns_for_coverage.bed
+```
+
+Original number of introns: 204,382.
+
+### 4. Analysis A: Average intron coverage profile
+
+#### Step 4.1. Generate normalized BigWig coverage files
+
+Use deepTools `bamCoverage` to generate CPM-normalized coverage tracks.
+
+```bash
+for sample in treat_1 treat_2 treat_3
+do
+    bamCoverage \
+        -b ${sample}Aligned.out.bam \
+        -o ${sample}.CPM.bw \
+        --normalizeUsing CPM \
+        --binSize 10 \
+        --minMappingQuality 10 \
+        -p 8
+done
+```
+
+Parameters:
+- `--normalizeUsing CPM`: normalizes coverage by mapped reads.
+- `--binSize 10`: uses 10-bp bins.
+- `--minMappingQuality 10`: filters low mapping-quality reads.
+- `-p 8`: uses eight processors.
+
+#### Step 4.2. Remove very short introns
+
+For the metaprofile, introns shorter than 50 bp were excluded.
+
+```bash
+awk 'BEGIN{FS=OFS="\t"} ($3-$2)>=50' \
+introns_for_coverage.bed > introns_50bp.bed
+```
+
+Check the number remaining:
+
+```bash
+wc -l introns_50bp.bed
+```
+
+Result: 146,286 introns.
+
+#### Step 4.3. Generate the coverage matrix
+
+```bash
+computeMatrix scale-regions \
+    -S treat_1.CPM.bw treat_2.CPM.bw treat_3.CPM.bw \
+    -R introns_50bp.bed \
+    --regionBodyLength 1000 \
+    --binSize 10 \
+    --averageTypeBins mean \
+    -p 8 \
+    -o intron_coverage_matrix_50bp.gz
+```
+
+This scales each intron to 1,000 bp, represented by 100 bins.
+
+BED6 strand information is used to orient negative-strand introns in the 5′–3′ direction.
+
+#### Step 4.4. Generate the average coverage profile
+
+```bash
+plotProfile \
+    -m intron_coverage_matrix_50bp.gz \
+    --outFileName intron_coverage_profile.png \
+    --plotTitle "RNA-seq intron coverage (5 to 3)" \
+    --samplesLabel "Treat 1" "Treat 2" "Treat 3" \
+    --yAxisLabel "Normalized coverage (CPM)" \
+    --plotType lines \
+    --outFileNameData intron_coverage_profile_data.tab
+```
+
+Outputs:
+- `intron_coverage_profile.png`
+- `intron_coverage_profile_data.tab`
+
+#### Step 4.5. Generate the heatmap
+
+```bash
+plotHeatmap \
+    -m intron_coverage_matrix_50bp.gz \
+    -out intron_coverage_heatmap.png \
+    --samplesLabel "Treat 1" "Treat 2" "Treat 3"
+```
+
+Output:
+- `intron_coverage_heatmap.png`
+
+### 5. Analysis B: Intron coverage breadth
+
+This analysis measures what proportion of each intron's bases overlap aligned RNA-seq reads.
+
+Unlike average coverage depth, coverage breadth measures whether a base has any read coverage.
+
+#### Step 5.1. Filter BAM files by mapping quality
+
+For Treat 1:
+
+```bash
+samtools view -bh -q 10 \
+    -o treat_1.mapq10.bam \
+    treat_1Aligned.out.bam
+```
+
+Repeat for Treat 2 and Treat 3:
+
+```bash
+for sample in treat_2 treat_3
+do
+    samtools view -bh -q 10 \
+        -o ${sample}.mapq10.bam \
+        ${sample}Aligned.out.bam
+done
+```
+
+#### Step 5.2. Calculate intron coverage with BEDTools
+
+For Treat 1:
+
+```bash
+bedtools coverage \
+    -a introns_50bp.bed \
+    -b treat_1.mapq10.bam \
+    -split \
+    > treat_1.intron_coverage.tsv
+```
+
+For Treat 2 and Treat 3:
+
+```bash
+for sample in treat_2 treat_3
+do
+    bedtools coverage \
+        -a introns_50bp.bed \
+        -b ${sample}.mapq10.bam \
+        -split \
+        > ${sample}.intron_coverage.tsv
+done
+```
+
+The `-split` option handles spliced alignments using their aligned blocks.
+
+The output contains the original six BED columns followed by four coverage columns:
+
+| Column | Description |
+|---|---|
+| 7 | Number of overlapping alignment features |
+| 8 | Number of intron bases covered |
+| 9 | Total intron length |
+| 10 | Fraction of intron bases covered |
+
+The tenth column is the important measurement.
+
+For example:
+- `0.00` = 0% covered
+- `0.25` = 25% covered
+- `0.50` = 50% covered
+- `0.75` = 75% covered
+- `1.00` = 100% covered
+
+Inspect the output:
+
+```bash
+head treat_1.intron_coverage.tsv
+```
+
+### 6. Categorize introns and generate bar plots
+
+Create a Python script:
+
+```bash
+cat > coverage_breadth.py <<'PY'
+import pandas as pd
+import matplotlib.pyplot as plt
+
+samples = ["treat_1", "treat_2", "treat_3"]
+
+categories = [
+    "0–<25%",
+    "25–<50%",
+    "50–<75%",
+    "75–<100%",
+    "100%"
+]
+
+results = {}
+
+for sample in samples:
+    df = pd.read_csv(
+        f"{sample}.intron_coverage.tsv",
+        sep="\t",
+        header=None
+    )
+
+    # Column 10 (index 9) is the fraction of intron bases covered
+    coverage = df.iloc[:, 9]
+
+    results[sample] = [
+        ((coverage >= 0) & (coverage < 0.25)).sum(),
+        ((coverage >= 0.25) & (coverage < 0.50)).sum(),
+        ((coverage >= 0.50) & (coverage < 0.75)).sum(),
+        ((coverage >= 0.75) & (coverage < 1.0)).sum(),
+        (coverage >= 1.0).sum()
+    ]
+
+summary = pd.DataFrame(results, index=categories)
+
+# Save intron counts
+summary.to_csv(
+    "intron_coverage_counts.tsv",
+    sep="\t"
+)
+
+# Calculate percentages within each replicate
+percentages = summary.div(
+    summary.sum(axis=0),
+    axis=1
+) * 100
+
+percentages.to_csv(
+    "intron_coverage_percentages.tsv",
+    sep="\t"
+)
+
+# Grouped bar plot
+ax = percentages.plot(
+    kind="bar",
+    figsize=(10, 6)
+)
+
+ax.set_xlabel("Intron coverage breadth")
+ax.set_ylabel("Percentage of introns (%)")
+ax.set_title("Intron coverage across RNA-seq replicates")
+ax.legend(title="Sample")
+
+plt.xticks(rotation=0)
+plt.tight_layout()
+
+plt.savefig(
+    "intron_coverage_barplot.png",
+    dpi=300
+)
+
+plt.close()
+
+# 100% stacked bar plot
+ax = percentages.T.plot(
+    kind="bar",
+    stacked=True,
+    figsize=(8, 6)
+)
+
+ax.set_xlabel("Sample")
+ax.set_ylabel("Percentage of introns (%)")
+ax.set_title("Distribution of intron coverage breadth")
+ax.legend(
+    title="Coverage category",
+    bbox_to_anchor=(1.02, 1)
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    "intron_coverage_stacked.png",
+    dpi=300
+)
+
+plt.close()
+
+print("\nINTRON COUNTS:")
+print(summary)
+
+print("\nPERCENTAGES:")
+print(percentages.round(2))
+PY
+```
+
+**Important:** Paste the entire block into the Linux terminal. Do not include the `cat` command inside the Python file itself.
+
+Run the analysis:
+
+```bash
+python3 coverage_breadth.py
+```
+
+Outputs:
+- `intron_coverage_counts.tsv`
+- `intron_coverage_percentages.tsv`
+- `intron_coverage_barplot.png`
+- `intron_coverage_stacked.png`
+
+### 7. Results from the original analysis
+
+The following percentages were obtained using 146,286 introns per replicate.
+
+| Coverage category | Treat 1 | Treat 2 | Treat 3 |
+|---|---:|---:|---:|
+| 0–less than 25% | 59.48% | 73.88% | 63.28% |
+| 25–less than 50% | 13.32% | 11.02% | 9.62% |
+| 50–less than 75% | 10.06% | 6.78% | 7.66% |
+| 75–less than 100% | 8.52% | 4.36% | 6.71% |
+| 100% | 8.62% | 3.96% | 12.72% |
+
+Initial observations:
+- Treat 3 had the highest percentage of completely covered introns.
+- Treat 2 had the lowest percentage of completely covered introns.
+- Treat 2 had the highest percentage of introns with less than 25% coverage.
+- The replicates showed differences in intron coverage breadth.
+
+### 8. Important methodological considerations
+
+1. **Strandedness:** The library strandedness has not yet been verified. The BigWig tracks and BEDTools coverage calculations are not strand-specific comparisons. Verify the library protocol before drawing final biological conclusions.
+
+2. **Coverage breadth versus depth:** Coverage breadth measures the fraction of intron bases with at least one overlapping alignment. It does not measure how many reads cover each base.
+
+3. **Zero coverage:** The first category (0–less than 25%) includes completely uncovered introns. These should be separated in a future analysis if the number of completely uncovered introns is important.
+
+4. **Intron annotation:** The introns were derived from the WBPS18 canonical gene set, not every possible transcript isoform.
+
+5. **Short introns:** Introns shorter than 50 bp were excluded from both analyses presented here so the metaprofile and breadth comparison use the same intron set.
+
+6. **Interpretation:** An average U-shaped profile does not establish that every intron has higher coverage at its ends. The heatmap can help determine whether the pattern is widespread or driven by a subset of introns.
+
+7. **Multimapping:** MAPQ filtering at 10 removes alignments below that threshold, but does not guarantee removal of every multimapping read.
+
+### 9. Final output checklist
+
+**Average coverage analysis**
+- [ ] `treat_1.CPM.bw`
+- [ ] `treat_2.CPM.bw`
+- [ ] `treat_3.CPM.bw`
+- [ ] `intron_coverage_matrix_50bp.gz`
+- [ ] `intron_coverage_profile.png`
+- [ ] `intron_coverage_heatmap.png`
+
+**Coverage breadth analysis**
+- [ ] `treat_1.intron_coverage.tsv`
+- [ ] `treat_2.intron_coverage.tsv`
+- [ ] `treat_3.intron_coverage.tsv`
+- [ ] `intron_coverage_counts.tsv`
+- [ ] `intron_coverage_percentages.tsv`
+- [ ] `intron_coverage_barplot.png`
+- [ ] `intron_coverage_stacked.png`
+
+**The workflow can be repeated with new RNA-seq samples by changing the sample names and using the corresponding BAM files, while retaining the same intron annotation and analysis parameters.**
